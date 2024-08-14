@@ -36,10 +36,13 @@ from .utils import (
     groupwise_affine_dequantize_tensor_from_qparams,
     pack_tinygemm_scales_and_zeros,
     groupwise_affine_quantize_tensor,
+    prepare_int4_weight_and_scales_and_zeros,
 )
 aten = torch.ops.aten
 
 from .quant_primitives import MappingType
+# This op gets the size of the packed buffer ( int4 weight + fp32 scales, fp32 bias ) from kleidiai internal C++ kernel call and exposes it to python frontend
+from torchao.ops import get_kai_weight_pack_int4_size # Unimplemented OP | WIP
 
 if not _lm_eval_available:
     logging.info("lm_eval is not installed, GPTQ may not be usable")
@@ -542,7 +545,8 @@ def linear_forward_int4(
         x.to(precision),
         weight_int4pack,
         groupsize,
-        scales_and_zeros.to(scales_precision)
+        scales_and_zeros.to(scales_precision,
+        out_features)
     ).to(dtype=x.dtype)
     new_shape = origin_x_size[:-1] + (out_features,)
     c = c.reshape(new_shape)
@@ -557,11 +561,12 @@ class WeightOnlyInt4Linear(torch.nn.Module):
     def __init__(
         self, in_features: int, out_features: int,
         # TODO: remove dtype field, not used
-        bias=False, device=None, dtype=None, groupsize: int = 128, inner_k_tiles: int = 8,
+        bias=None, device=None, dtype=None, groupsize: int = 128, inner_k_tiles: int = 8,
         precision: torch.dtype = torch.bfloat16, scales_precision: torch.dtype = torch.bfloat16,
+        scheme=None,
     ) -> None:
         super().__init__()
-        self.padding = not _check_linear_int4_k(in_features, groupsize, inner_k_tiles)
+        self.padding = scheme is None and not _check_linear_int4_k(in_features, groupsize, inner_k_tiles)
         if self.padding:
             from .utils import find_multiple
             self.origin_in_features = in_features
@@ -569,31 +574,53 @@ class WeightOnlyInt4Linear(torch.nn.Module):
 
         self.in_features = in_features
         self.out_features = out_features
-        assert not bias, "require bias=False"
         self.device = device
         self.groupsize = groupsize
         self.inner_k_tiles = inner_k_tiles
         self.precision = precision
         self.scales_precision = scales_precision
+        self.scheme = scheme
+        self.bias = bias
 
         if dtype is not None:
             raise ValueError("Please specify 'precision' instead of 'dtype'")
-
-        assert out_features % 8 == 0, "require out_features % 8 == 0"
-        assert in_features % (inner_k_tiles * 16) == 0, "require in_features % (innerKTiles * 16) == 0"
-        self.register_buffer(
+        if scheme is None:
+            assert not bias, "require bias=None"
+            assert out_features % 8 == 0, "require out_features % 8 == 0"
+            assert in_features % (inner_k_tiles * 16) == 0, "require in_features % (innerKTiles * 16) == 0"
+            self.register_buffer(
+                "weight",
+                torch.empty((out_features // 8, in_features // (inner_k_tiles * 16), 32, inner_k_tiles // 2), dtype=torch.int32, device=device)
+            )
+            self.dtype = dtype
+            self.register_buffer(
+                "scales_and_zeros",
+                torch.empty((in_features // groupsize, out_features, 2), dtype=self.scales_precision, device=device)
+            )
+        elif scheme == "symmetric_groupwise":
+            assert not bias, "require bias=None"
+            self.register_buffer(
             "weight",
-            torch.empty((out_features // 8, in_features // (inner_k_tiles * 16), 32, inner_k_tiles // 2), dtype=torch.int32, device=device)
-        )
-        self.dtype = dtype
-        self.register_buffer(
-            "scales_and_zeros",
-            torch.empty((in_features // groupsize, out_features, 2), dtype=self.scales_precision, device=device)
-        )
+            torch.empty((get_kai_weight_pack_int4_size(out_features,in_features,groupsize)), dtype=torch.uint8)
+            )
+            self.register_buffer(
+                "scales_and_zeros",
+                torch.empty((0), dtype=self.scales_precision)
+            )
+        elif scheme == "symmetric_channelwise":
+            self.register_buffer(
+            "weight",
+            torch.empty((get_kai_weight_pack_int4_size(out_features,in_features,groupsize)), dtype=torch.uint8)
+            )
+            self.register_buffer(
+                "scales_and_zeros",
+                torch.empty((out_features), dtype=self.scales_precision)
+            )
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if self.padding:
             input = F.pad(input, pad=(0, self.in_features - self.origin_in_features))
+
         return linear_forward_int4(
             input,
             self.weight,
@@ -603,7 +630,6 @@ class WeightOnlyInt4Linear(torch.nn.Module):
             self.precision,
             self.scales_precision,
         )
-
 
 def _replace_linear_int4(
     module: torch.nn.Module,
@@ -615,19 +641,32 @@ def _replace_linear_int4(
     scales_precision: torch.dtype = torch.bfloat16,
     linear_class: Type[torch.nn.Module] = WeightOnlyInt4Linear,
     copy_weights: bool = False,
+    scheme=None,
 ):
     for name, child in module.named_children():
         if isinstance(child, nn.Linear) and (skip_layer_func is None or not skip_layer_func(child.weight)):
-            if _check_linear_int4_k(child.in_features, groupsize, inner_k_tiles) or padding_allowed:
+            bias = None
+            if child.bias is not None:
+                bias = child.bias
+            if scheme is not None or _check_linear_int4_k(child.in_features, groupsize, inner_k_tiles) or padding_allowed:
+                if scheme == "symmetric_channelwise":
+                    groupsize = child.in_features
+                    scales_precision = torch.float32
+                elif scheme == "symmetric_groupwise":
+                    # Scales are actually f16 but they are packed along with weights
+                    # To maintain api compatibility we populate scaled with no element in this scheme
+                    scales_precision = torch.float32
+
                 new_linear = linear_class(
                     child.in_features,
                     child.out_features,
-                    bias=False,
+                    bias=bias,
                     device=child.weight.device,
                     groupsize=groupsize,
                     inner_k_tiles=inner_k_tiles,
                     precision=precision,
                     scales_precision=scales_precision,
+                    scheme=scheme,
                 )
                 # TODO: merge with 8da4w?
                 # In distributed training, the model may be instantiated
@@ -647,6 +686,7 @@ def _replace_linear_int4(
                 scales_precision,
                 linear_class,
                 copy_weights,
+                scheme=scheme,
             )
 
 
@@ -669,10 +709,11 @@ class Int4WeightOnlyQuantizer(Quantizer):
         inner_k_tiles: Optional[int] = 8,
         device: torch.device = torch.device("cuda"),
         precision: torch.dtype = torch.bfloat16,
+        scheme = None
     ) -> None:
         super().__init__()
         assert inner_k_tiles in [2, 4, 8]
-        assert groupsize in [32, 64, 128, 256]
+        assert groupsize in [0, 32, 64, 128, 256] # 0 group size is allowed for channelwise scheme where groupsize = row size
 
         self.inner_k_tiles = inner_k_tiles
         self.groupsize: int = groupsize
@@ -680,6 +721,7 @@ class Int4WeightOnlyQuantizer(Quantizer):
         self.device: torch.device = device
         # precision and dtype are being used interchangeably here
         self.precision: torch.dtype = precision
+        self.scheme = scheme
 
     @torch.no_grad()
     def _create_quantized_state_dict(
@@ -688,18 +730,23 @@ class Int4WeightOnlyQuantizer(Quantizer):
         cur_state_dict = model.state_dict()
         for fqn, mod in model.named_modules():
             if isinstance(mod, torch.nn.Linear):
-                assert not mod.bias
+                if self.scheme is None or self.scheme == "symmetric_groupwise":
+                    assert not mod.bias
+                bias = torch.empty((0))
+                if mod.bias is not None:
+                    bias = mod.bias
                 out_features = mod.out_features
                 in_features = mod.in_features
                 # assert out_features % 8 == 0, "require out_features % 8 == 0"
                 logging.info(f"linear: {fqn}, in={in_features}, out={out_features}")
 
-                assert (
-                    in_features % self.groupsize == 0
-                ), f"require in_features:{in_features} % self.groupsize:{self.groupsize} == 0"
+                if self.scheme is None:
+                    assert (
+                        in_features % self.groupsize == 0
+                    ), f"require in_features:{in_features} % self.groupsize:{self.groupsize} == 0"
 
                 weight = mod.weight.data
-                if not _check_linear_int4_k(
+                if self.scheme is None and not _check_linear_int4_k(
                     in_features, self.groupsize, self.inner_k_tiles
                 ):
                     if self.padding_allowed:
@@ -712,19 +759,29 @@ class Int4WeightOnlyQuantizer(Quantizer):
                         logging.warn(f"warning: {fqn} is skipped, int4 requires that in_features is 32, 64, or is divisible by 1024, " +
                                 "and that groupsize and inner_k_tiles*16 evenly divide into it")
                         continue
-                (
-                    w_int4x8,
-                    scales_and_zeros
-                ) = groupwise_affine_quantize_tensor(
-                    weight,
-                    4,  # n_bit
-                    self.groupsize,
-                    self.precision, # dtype for scales_and_zeros
-                )
-                # TODO: just get the device from mod.weight.device?
-                weight_int4pack = torch.ops.aten._convert_weight_to_int4pack(w_int4x8.to(self.device), self.inner_k_tiles)
+                if self.scheme == "symmetric_channelwise" or self.scheme == "symmetric_groupwise" :
+                    (
+                        w_int4x8,
+                        scales_and_zeros
+                    ) = prepare_int4_weight_and_scales_and_zeros(
+                    weight.to(self.precision), self.groupsize, self.inner_k_tiles, self.scheme, precision=self.precision
+                    )
+                else:
+                    (
+                        w_int4x8,
+                        scales_and_zeros
+                    ) = groupwise_affine_quantize_tensor(
+                        weight,
+                        4,  # n_bit
+                        self.groupsize,
+                        self.precision, # dtype for scales_and_zeros
+                    )
+                    # TODO: just get the device from mod.weight.device?
+                weight_int4pack = torch.ops.aten._convert_weight_to_int4pack(w_int4x8.to(self.device), self.inner_k_tiles, self.groupsize,mod.out_features, scales_and_zeros, bias)
                 cur_state_dict[f"{fqn}.weight"] = weight_int4pack.to(self.device)
                 cur_state_dict[f"{fqn}.scales_and_zeros"] = scales_and_zeros.to(self.device)
+                if mod.bias is not None:
+                    cur_state_dict[f"{fqn}.bias"] = mod.bias.to(self.device)
         return cur_state_dict
 
     def _convert_for_runtime(self, model: torch.nn.Module) -> torch.nn.Module:
@@ -736,6 +793,7 @@ class Int4WeightOnlyQuantizer(Quantizer):
             skip_layer_func=None,
             precision=self.precision,
             scales_precision=self.precision,
+            scheme=self.scheme,
         )
         return model
 
